@@ -1,0 +1,14 @@
+{
+  "name": "@cue/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "node --check src/server.js",
+    "test": "node --test src/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.18"
+  }
+}
