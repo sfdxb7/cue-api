@@ -3,6 +3,8 @@ import { afterEach, beforeEach, test } from "node:test";
 import {
   answerCueIntelligence,
   createCueApiServer,
+  createSentinelSplitter,
+  parseSseChunk,
   transcribeCueAudio
 } from "./server.js";
 
@@ -334,6 +336,81 @@ test("transcribeCueAudio surfaces provider rejections as retryable errors", asyn
       return true;
     }
   );
+});
+
+test("createSentinelSplitter handles sentinels straddling chunk boundaries", () => {
+  const splitter = createSentinelSplitter("===CUE_JSON===");
+  let emitted = "";
+
+  emitted += splitter.push("Answer text ===CUE");
+  emitted += splitter.push('_JSON==={"suggestion":"ask"}');
+  const { remainder, trailer } = splitter.finish();
+
+  assert.equal(emitted + remainder, "Answer text ");
+  assert.equal(trailer, '{"suggestion":"ask"}');
+});
+
+test("streaming intelligence emits deltas and a structured final event", async () => {
+  const upstreamBody = [
+    'event: response.output_text.delta\ndata: {"delta":"Hello "}\n\n',
+    'event: response.output_text.delta\ndata: {"delta":"world. ===CUE_JSON==={\\"suggestion\\":\\"Ask about cost.\\"}"}\n\n'
+  ].join("");
+
+  const options = {
+    apiKey: "test-key",
+    fetch: async () =>
+      new Response(upstreamBody, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" }
+      })
+  };
+
+  await withCueApiServer(options, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/intelligence`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify(buildLiveRequest())
+    });
+
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+
+    const raw = await response.text();
+    const { events } = parseSseChunk(raw);
+    const deltas = events.filter((event) => event.event === "delta");
+    const finals = events.filter((event) => event.event === "final");
+
+    assert.ok(deltas.length > 0);
+    assert.equal(finals.length, 1);
+
+    const finalPayload = JSON.parse(finals[0].data);
+    assert.equal(finalPayload.answer, "Hello world.");
+    assert.equal(finalPayload.suggestion, "Ask about cost.");
+
+    const streamedText = deltas.map((event) => JSON.parse(event.data).text).join("");
+    assert.equal(streamedText, "Hello world. ");
+  });
+});
+
+test("streaming intelligence falls back to a final event without an API key", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/intelligence`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify(buildLiveRequest())
+    });
+
+    const { events } = parseSseChunk(await response.text());
+    const finals = events.filter((event) => event.event === "final");
+
+    assert.equal(finals.length, 1);
+    assert.equal(JSON.parse(finals[0].data).provider, "fallback");
+  });
 });
 
 test("persistence endpoints return 503 when no store is configured", async () => {
