@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
+import { createSupabaseStore, isStoreError } from "./store.js";
 
 const openAiResponsesUrl = "https://api.openai.com/v1/responses";
 const openAiTranscriptionsUrl = "https://api.openai.com/v1/audio/transcriptions";
@@ -13,6 +14,24 @@ const maxTranscriptLength = 24000;
 const maxTranscribePromptLength = 500;
 const maxImageBytes = 8 * 1024 * 1024;
 const validImageMimeTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const maxMeetingTitleLength = 200;
+const maxMeetingLabelLength = 64;
+const maxMeetingChips = 12;
+const maxChipLength = 40;
+const maxMinutesSummaryLength = 4000;
+const maxMinutesListItems = 20;
+const maxMinutesItemLength = 500;
+const maxChatMessages = 200;
+const maxChatBodyLength = 2000;
+const maxMomentTitleLength = 300;
+const maxMomentSummaryLength = 1000;
+const maxMomentTags = 8;
+const maxMomentsPerInsert = 20;
+const maxStoredTranscriptLength = 400000;
+const validMomentTypes = new Set(["Key Moment", "Decision", "Follow-up", "Unclear Item", "Note"]);
+const validMeetingStatuses = new Set(["ready", "processing", "transcript_missing"]);
+const meetingIdPattern = /^[A-Za-z0-9-]{1,64}$/;
+const deviceIdPattern = /^[A-Za-z0-9-]{8,64}$/;
 const audioExtensionsByMimeType = new Map([
   ["audio/webm", "webm"],
   ["audio/ogg", "ogg"],
@@ -32,8 +51,142 @@ const defaultRateLimitMax = 30;
 const defaultRateLimitWindowMs = 60 * 1000;
 const validActions = new Set(["Save moment", "Draft reply"]);
 
+const apiRoutes = [
+  {
+    method: "POST",
+    pattern: /^\/api\/intelligence$/,
+    hasBody: true,
+    async handle({ body, options }) {
+      const cueRequest = validateCueRequest(body);
+      return { status: 200, body: await answerCueIntelligence(cueRequest, options) };
+    }
+  },
+  {
+    method: "POST",
+    pattern: /^\/api\/transcribe$/,
+    hasBody: true,
+    async handle({ body, options }) {
+      const transcribeRequest = validateTranscribeRequest(body);
+      return { status: 200, body: await transcribeCueAudio(transcribeRequest, options) };
+    }
+  },
+  {
+    method: "GET",
+    pattern: /^\/api\/meetings$/,
+    hasBody: false,
+    async handle({ request, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+
+      return { status: 200, body: { meetings: await store.listMeetings(deviceId) } };
+    }
+  },
+  {
+    method: "POST",
+    pattern: /^\/api\/meetings$/,
+    hasBody: true,
+    async handle({ request, body, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+      const meeting = validateMeeting(body?.meeting);
+
+      return { status: 201, body: { meeting: await store.upsertMeeting(deviceId, meeting) } };
+    }
+  },
+  {
+    method: "PATCH",
+    pattern: /^\/api\/meetings\/([A-Za-z0-9-]{1,64})$/,
+    hasBody: true,
+    async handle({ request, body, params, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+      const patch = validateMeetingPatch(body);
+      const meeting = await store.patchMeeting(deviceId, params[0], patch);
+
+      if (!meeting) {
+        throw createHttpError(404, "Meeting not found.");
+      }
+
+      return { status: 200, body: { meeting } };
+    }
+  },
+  {
+    method: "DELETE",
+    pattern: /^\/api\/meetings\/([A-Za-z0-9-]{1,64})$/,
+    hasBody: false,
+    async handle({ request, params, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+      const deleted = await store.deleteMeeting(deviceId, params[0]);
+
+      if (!deleted) {
+        throw createHttpError(404, "Meeting not found.");
+      }
+
+      return { status: 204, body: null };
+    }
+  },
+  {
+    method: "POST",
+    pattern: /^\/api\/meetings\/([A-Za-z0-9-]{1,64})\/moments$/,
+    hasBody: true,
+    async handle({ request, body, params, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+      const moments = validateMoments(body?.moments);
+      const count = await store.insertMoments(deviceId, params[0], moments);
+
+      return { status: 201, body: { count } };
+    }
+  },
+  {
+    method: "PUT",
+    pattern: /^\/api\/meetings\/([A-Za-z0-9-]{1,64})\/transcript$/,
+    hasBody: true,
+    async handle({ request, body, params, store }) {
+      const deviceId = requireDevice(request);
+      requireStore(store);
+      const transcript = getString(body?.transcript);
+
+      if (!transcript) {
+        throw createHttpError(400, "Transcript is required.");
+      }
+
+      if (transcript.length > maxStoredTranscriptLength) {
+        throw createHttpError(413, "Transcript is too large.");
+      }
+
+      await store.putTranscript(deviceId, params[0], transcript);
+      return { status: 204, body: null };
+    }
+  }
+];
+
+function matchRoute(method, pathname) {
+  let pathExists = false;
+  const allowedMethods = new Set();
+
+  for (const route of apiRoutes) {
+    const match = pathname.match(route.pattern);
+
+    if (!match) {
+      continue;
+    }
+
+    pathExists = true;
+    allowedMethods.add(route.method);
+
+    if (route.method === method) {
+      return { route, params: match.slice(1) };
+    }
+  }
+
+  return pathExists ? { methodNotAllowed: [...allowedMethods] } : null;
+}
+
 export function createCueApiServer(options = {}) {
   const rateLimiter = createRateLimiter(options);
+  const store = options.store !== undefined ? options.store : createSupabaseStore(options);
 
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
@@ -59,18 +212,20 @@ export function createCueApiServer(options = {}) {
       return;
     }
 
-    if (url.pathname !== "/api/intelligence" && url.pathname !== "/api/transcribe") {
+    const matched = matchRoute(request.method ?? "GET", url.pathname);
+
+    if (!matched) {
       sendJson(response, 404, { error: "Not found." }, corsHeaders);
       return;
     }
 
-    if (request.method !== "POST") {
+    if (matched.methodNotAllowed) {
       sendJson(
         response,
         405,
         { error: "Method not allowed." },
         corsHeaders,
-        { Allow: "POST, OPTIONS" }
+        { Allow: [...matched.methodNotAllowed, "OPTIONS"].join(", ") }
       );
       return;
     }
@@ -94,23 +249,33 @@ export function createCueApiServer(options = {}) {
     }
 
     try {
-      const body = await readJsonBody(request, getMaxBodyBytes(options));
+      const body = matched.route.hasBody
+        ? await readJsonBody(request, getMaxBodyBytes(options))
+        : null;
+      const result = await matched.route.handle({
+        request,
+        body,
+        params: matched.params,
+        options,
+        store
+      });
 
-      if (url.pathname === "/api/transcribe") {
-        const transcribeRequest = validateTranscribeRequest(body);
-        const result = await transcribeCueAudio(transcribeRequest, options);
-
-        sendJson(response, 200, result, corsHeaders);
+      if (result.status === 204) {
+        writeHeaders(response, { ...corsHeaders, "Cache-Control": "no-store" });
+        response.writeHead(204);
+        response.end();
         return;
       }
 
-      const cueRequest = validateCueRequest(body);
-      const result = await answerCueIntelligence(cueRequest, options);
-
-      sendJson(response, 200, result, corsHeaders);
+      sendJson(response, result.status, result.body, corsHeaders);
     } catch (error) {
       if (isHttpError(error)) {
         sendJson(response, error.statusCode, { error: error.message }, corsHeaders);
+        return;
+      }
+
+      if (isStoreError(error)) {
+        sendJson(response, 502, { error: error.message }, corsHeaders);
         return;
       }
 
@@ -121,6 +286,220 @@ export function createCueApiServer(options = {}) {
       sendJson(response, 500, { error: "Cue intelligence failed." }, corsHeaders);
     }
   });
+}
+
+function requireDevice(request) {
+  const deviceId = getHeaderValue(request, "x-cue-device");
+
+  if (!deviceId || !deviceIdPattern.test(deviceId)) {
+    throw createHttpError(400, "A valid X-Cue-Device header is required.");
+  }
+
+  return deviceId;
+}
+
+function requireStore(store) {
+  if (!store) {
+    throw createHttpError(503, "Persistence is not configured.");
+  }
+}
+
+function validateMeeting(value) {
+  if (!isRecord(value)) {
+    throw createHttpError(400, "Meeting must be a JSON object.");
+  }
+
+  const id = getString(value.id);
+  const title = getString(value.title);
+
+  if (!id || !meetingIdPattern.test(id)) {
+    throw createHttpError(400, "Meeting id must be 1-64 alphanumeric or dash characters.");
+  }
+
+  if (!title || title.length > maxMeetingTitleLength) {
+    throw createHttpError(400, `Meeting title is required (max ${maxMeetingTitleLength} chars).`);
+  }
+
+  if (!validMeetingStatuses.has(value.status)) {
+    throw createHttpError(400, "Meeting status must be ready, processing, or transcript_missing.");
+  }
+
+  return {
+    id,
+    title,
+    status: value.status,
+    dateLabel: capString(getString(value.dateLabel) ?? "", maxMeetingLabelLength),
+    duration: capString(getString(value.duration) ?? "", maxMeetingLabelLength),
+    people: getPositiveNumber(value.people, 0),
+    chips: validateChips(value.chips),
+    minutes: validateMinutes(value.minutes),
+    chat: validateChat(value.chat),
+    moments: Array.isArray(value.moments) ? validateMoments(value.moments, true) : [],
+    createdAt: getIsoString(value.createdAt) ?? new Date().toISOString(),
+    updatedAt: getIsoString(value.updatedAt) ?? new Date().toISOString()
+  };
+}
+
+function validateMeetingPatch(value) {
+  if (!isRecord(value)) {
+    throw createHttpError(400, "Meeting patch must be a JSON object.");
+  }
+
+  const patch = { updatedAt: getIsoString(value.updatedAt) ?? new Date().toISOString() };
+
+  if (value.title !== undefined) {
+    const title = getString(value.title);
+
+    if (!title || title.length > maxMeetingTitleLength) {
+      throw createHttpError(400, `Meeting title is required (max ${maxMeetingTitleLength} chars).`);
+    }
+
+    patch.title = title;
+  }
+
+  if (value.status !== undefined) {
+    if (!validMeetingStatuses.has(value.status)) {
+      throw createHttpError(400, "Meeting status must be ready, processing, or transcript_missing.");
+    }
+
+    patch.status = value.status;
+  }
+
+  if (value.dateLabel !== undefined) {
+    patch.dateLabel = capString(getString(value.dateLabel) ?? "", maxMeetingLabelLength);
+  }
+
+  if (value.duration !== undefined) {
+    patch.duration = capString(getString(value.duration) ?? "", maxMeetingLabelLength);
+  }
+
+  if (value.people !== undefined) {
+    patch.people = getPositiveNumber(value.people, 0);
+  }
+
+  if (value.chips !== undefined) {
+    patch.chips = validateChips(value.chips);
+  }
+
+  if (value.minutes !== undefined) {
+    patch.minutes = validateMinutes(value.minutes);
+  }
+
+  if (value.chat !== undefined) {
+    patch.chat = validateChat(value.chat);
+  }
+
+  return patch;
+}
+
+function validateChips(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((chip) => typeof chip === "string" && chip.trim())
+    .slice(0, maxMeetingChips)
+    .map((chip) => capString(chip, maxChipLength));
+}
+
+function validateMinutes(value) {
+  const minutes = isRecord(value) ? value : {};
+
+  return {
+    summary: capString(getString(minutes.summary) ?? "", maxMinutesSummaryLength),
+    decisions: validateMinutesList(minutes.decisions),
+    actions: validateMinutesList(minutes.actions),
+    unclearItems: validateMinutesList(minutes.unclearItems)
+  };
+}
+
+function validateMinutesList(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item) => typeof item === "string" && item.trim())
+    .slice(0, maxMinutesListItems)
+    .map((item) => capString(item, maxMinutesItemLength));
+}
+
+function validateChat(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(
+      (message) =>
+        isRecord(message) &&
+        getString(message.id) &&
+        getString(message.body) &&
+        (message.sender === "user" || message.sender === "cue")
+    )
+    .slice(0, maxChatMessages)
+    .map((message) => ({
+      id: message.id,
+      sender: message.sender,
+      body: capString(message.body, maxChatBodyLength),
+      ...(getString(message.context) ? { context: capString(message.context, maxChipLength * 4) } : {}),
+      ...(getString(message.source) ? { source: capString(message.source, maxChipLength * 4) } : {})
+    }));
+}
+
+function validateMoments(value, lenient = false) {
+  if (!Array.isArray(value) || (!lenient && (value.length === 0 || value.length > maxMomentsPerInsert))) {
+    throw createHttpError(400, `Moments must be an array of 1-${maxMomentsPerInsert} items.`);
+  }
+
+  const moments = value.flatMap((moment) => {
+    if (!isRecord(moment)) {
+      return [];
+    }
+
+    const id = getString(moment.id);
+    const title = getString(moment.title);
+    const summary = getString(moment.summary);
+    const timestamp = getString(moment.timestamp);
+    const context = getString(moment.context);
+
+    if (!id || !title || !summary || !timestamp || !context || !validMomentTypes.has(moment.type)) {
+      return [];
+    }
+
+    return [
+      {
+        id: capString(id, maxMeetingLabelLength),
+        type: moment.type,
+        title: capString(title, maxMomentTitleLength),
+        summary: capString(summary, maxMomentSummaryLength),
+        timestamp: capString(timestamp, maxMeetingLabelLength),
+        context: capString(context, maxMeetingLabelLength * 2),
+        hasScreenshot: Boolean(moment.hasScreenshot),
+        tags: Array.isArray(moment.tags)
+          ? moment.tags
+              .filter((tag) => typeof tag === "string" && tag.trim())
+              .slice(0, maxMomentTags)
+              .map((tag) => capString(tag, maxChipLength))
+          : []
+      }
+    ];
+  });
+
+  if (!lenient && moments.length === 0) {
+    throw createHttpError(400, "No valid moments were provided.");
+  }
+
+  return moments;
+}
+
+function capString(value, maxLength) {
+  return typeof value === "string" ? value.slice(0, maxLength) : "";
+}
+
+function getIsoString(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined;
 }
 
 export async function answerCueIntelligence(request, options = {}) {
@@ -607,7 +986,7 @@ function buildCorsHeaders(request, options) {
   const headers = {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Cue-Token",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Cue-Token, X-Cue-Device",
     "Access-Control-Max-Age": "86400"
   };
 

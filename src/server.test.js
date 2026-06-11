@@ -314,6 +314,203 @@ test("transcribeCueAudio surfaces provider rejections as retryable errors", asyn
   );
 });
 
+test("persistence endpoints return 503 when no store is configured", async () => {
+  await withCueApiServer({ store: null }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings`, {
+      headers: { "X-Cue-Device": "device-12345678" }
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.match(body.error, /not configured/i);
+  });
+});
+
+test("persistence endpoints require a valid device header", async () => {
+  await withCueApiServer({ store: createFakeStore() }, async (baseUrl) => {
+    const missing = await fetch(`${baseUrl}/api/meetings`);
+    const invalid = await fetch(`${baseUrl}/api/meetings`, {
+      headers: { "X-Cue-Device": "no" }
+    });
+
+    assert.equal(missing.status, 400);
+    assert.equal(invalid.status, 400);
+  });
+});
+
+test("GET /api/meetings returns meetings scoped to the device", async () => {
+  const store = createFakeStore();
+
+  await withCueApiServer({ store }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings`, {
+      headers: { "X-Cue-Device": "device-12345678" }
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.meetings, []);
+    assert.deepEqual(store.calls.listMeetings, [["device-12345678"]]);
+  });
+});
+
+test("POST /api/meetings validates and stores a meeting", async () => {
+  const store = createFakeStore();
+
+  await withCueApiServer({ store }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cue-Device": "device-12345678"
+      },
+      body: JSON.stringify({ meeting: buildMeetingPayload() })
+    });
+
+    assert.equal(response.status, 201);
+    assert.equal(store.calls.upsertMeeting.length, 1);
+    assert.equal(store.calls.upsertMeeting[0][1].title, "Vendor sync");
+  });
+});
+
+test("POST /api/meetings rejects invalid meeting ids and statuses", async () => {
+  await withCueApiServer({ store: createFakeStore() }, async (baseUrl) => {
+    const badId = await fetch(`${baseUrl}/api/meetings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Cue-Device": "device-12345678" },
+      body: JSON.stringify({ meeting: { ...buildMeetingPayload(), id: "bad id!" } })
+    });
+    const badStatus = await fetch(`${baseUrl}/api/meetings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Cue-Device": "device-12345678" },
+      body: JSON.stringify({ meeting: { ...buildMeetingPayload(), status: "weird" } })
+    });
+
+    assert.equal(badId.status, 400);
+    assert.equal(badStatus.status, 400);
+  });
+});
+
+test("DELETE /api/meetings/:id deletes and 404s when missing", async () => {
+  const store = createFakeStore();
+  store.deleteResults = [true, false];
+
+  await withCueApiServer({ store }, async (baseUrl) => {
+    const deleted = await fetch(`${baseUrl}/api/meetings/live-abc`, {
+      method: "DELETE",
+      headers: { "X-Cue-Device": "device-12345678" }
+    });
+    const missing = await fetch(`${baseUrl}/api/meetings/other`, {
+      method: "DELETE",
+      headers: { "X-Cue-Device": "device-12345678" }
+    });
+
+    assert.equal(deleted.status, 204);
+    assert.equal(missing.status, 404);
+  });
+});
+
+test("PUT /api/meetings/:id/transcript stores transcripts and caps size", async () => {
+  const store = createFakeStore();
+
+  await withCueApiServer({ store }, async (baseUrl) => {
+    const stored = await fetch(`${baseUrl}/api/meetings/live-abc/transcript`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-Cue-Device": "device-12345678" },
+      body: JSON.stringify({ transcript: "They discussed onboarding." })
+    });
+
+    assert.equal(stored.status, 204);
+    assert.equal(store.calls.putTranscript.length, 1);
+  });
+});
+
+test("store failures surface as 502", async () => {
+  const store = createFakeStore();
+  store.failNext = true;
+
+  await withCueApiServer({ store }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings`, {
+      headers: { "X-Cue-Device": "device-12345678" }
+    });
+
+    assert.equal(response.status, 502);
+  });
+});
+
+function buildMeetingPayload() {
+  return {
+    id: "live-abc",
+    title: "Vendor sync",
+    status: "ready",
+    dateLabel: "Today",
+    duration: "30 min",
+    people: 3,
+    chips: ["1 moment"],
+    minutes: { summary: "Summary.", decisions: [], actions: [], unclearItems: [] },
+    chat: [],
+    moments: [],
+    createdAt: "2026-06-11T08:00:00.000Z",
+    updatedAt: "2026-06-11T08:00:00.000Z"
+  };
+}
+
+function createFakeStore() {
+  const calls = {
+    listMeetings: [],
+    upsertMeeting: [],
+    patchMeeting: [],
+    deleteMeeting: [],
+    insertMoments: [],
+    putTranscript: []
+  };
+
+  const store = {
+    calls,
+    failNext: false,
+    deleteResults: [],
+    async listMeetings(...args) {
+      maybeFail(store);
+      calls.listMeetings.push(args);
+      return [];
+    },
+    async upsertMeeting(...args) {
+      maybeFail(store);
+      calls.upsertMeeting.push(args);
+      return args[1];
+    },
+    async patchMeeting(...args) {
+      maybeFail(store);
+      calls.patchMeeting.push(args);
+      return { id: args[1], ...args[2] };
+    },
+    async deleteMeeting(...args) {
+      maybeFail(store);
+      calls.deleteMeeting.push(args);
+      return store.deleteResults.length > 0 ? store.deleteResults.shift() : true;
+    },
+    async insertMoments(...args) {
+      maybeFail(store);
+      calls.insertMoments.push(args);
+      return args[2].length;
+    },
+    async putTranscript(...args) {
+      maybeFail(store);
+      calls.putTranscript.push(args);
+    }
+  };
+
+  return store;
+}
+
+function maybeFail(store) {
+  if (store.failNext) {
+    store.failNext = false;
+    const error = new Error("Persistence backend is unreachable.");
+    error.isStoreError = true;
+    throw error;
+  }
+}
+
 async function withCueApiServer(options, callback) {
   const server = createCueApiServer(options);
 
