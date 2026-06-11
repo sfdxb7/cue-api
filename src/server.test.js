@@ -437,6 +437,73 @@ test("store failures surface as 502", async () => {
   });
 });
 
+test("POST /api/meetings/:id/minutes generates structured minutes from a transcript", async () => {
+  let capturedBody;
+  const options = {
+    store: null,
+    apiKey: "test-key",
+    fetch: async (url, init) => {
+      capturedBody = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({
+          output_text: JSON.stringify({
+            title: "Pricing decision sync",
+            summary: "The team agreed on bundling.",
+            decisions: ["Bundle onboarding."],
+            actions: ["Sara: confirm cost."],
+            unclearItems: []
+          })
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  };
+
+  await withCueApiServer(options, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings/live-abc/minutes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transcript: "Sara: We will bundle onboarding. Mark: Confirm the cost first.",
+        elapsedSeconds: 1200
+      })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.title, "Pricing decision sync");
+    assert.deepEqual(body.minutes.decisions, ["Bundle onboarding."]);
+    assert.equal(capturedBody.text.format.type, "json_schema");
+    assert.match(capturedBody.input[0].content[0].text, /untrusted_meeting_data/);
+  });
+});
+
+test("POST /api/meetings/:id/minutes returns 422 without a transcript", async () => {
+  await withCueApiServer({ store: null, apiKey: "test-key" }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings/live-abc/minutes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ elapsedSeconds: 60 })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 422);
+    assert.match(body.error, /transcript/i);
+  });
+});
+
+test("POST /api/meetings/:id/minutes refuses to fake minutes without an API key", async () => {
+  await withCueApiServer({ store: null }, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/meetings/live-abc/minutes`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transcript: "Some transcript." })
+    });
+
+    assert.equal(response.status, 503);
+  });
+});
+
 function buildMeetingPayload() {
   return {
     id: "live-abc",
