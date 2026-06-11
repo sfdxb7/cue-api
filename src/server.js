@@ -52,8 +52,7 @@ export function createCueApiServer(options = {}) {
         200,
         {
           ok: true,
-          service: "cue-api",
-          version: "0.1.0"
+          service: "cue-api"
         },
         corsHeaders
       );
@@ -318,7 +317,7 @@ function buildCuePrompt(request) {
     `Mode: ${request.mode}`,
     "<untrusted_meeting_data>",
     `Question: ${request.question}`,
-    `Context JSON: ${JSON.stringify(context)}`,
+    `Context JSON: ${JSON.stringify(context).slice(0, 32000)}`,
     "</untrusted_meeting_data>"
   ].join("\n");
 }
