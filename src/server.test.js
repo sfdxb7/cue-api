@@ -99,6 +99,28 @@ test("POST /api/intelligence requires the shared token when configured", async (
   });
 });
 
+test("intent values are allowlisted into the prompt and invalid ones dropped", async () => {
+  const prompts = [];
+  const options = {
+    apiKey: "test-key",
+    fetch: async (url, init) => {
+      prompts.push(JSON.parse(init.body).input[0].content[0].text);
+      return new Response(JSON.stringify({ output_text: '{"answer":"ok"}' }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  };
+
+  await withCueApiServer(options, async (baseUrl) => {
+    await postCueQuestion(baseUrl, { ...buildLiveRequest(), intent: "catch_up" });
+    await postCueQuestion(baseUrl, { ...buildLiveRequest(), intent: "evil_intent" });
+  });
+
+  assert.match(prompts[0], /Intent: catch_up/);
+  assert.doesNotMatch(prompts[1], /Intent:/);
+});
+
 test("answerCueIntelligence parses compact OpenAI JSON responses", async () => {
   const result = await answerCueIntelligence(buildLiveRequest(), {
     apiKey: "test-key",
