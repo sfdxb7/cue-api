@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
-import { answerCueIntelligence, createCueApiServer } from "./server.js";
+import {
+  answerCueIntelligence,
+  createCueApiServer,
+  transcribeCueAudio
+} from "./server.js";
 
 let originalEnv;
 
@@ -120,6 +124,110 @@ test("answerCueIntelligence parses compact OpenAI JSON responses", async () => {
   assert.equal(result.source, "screen + transcript");
 });
 
+test("POST /api/transcribe explains when transcription is not configured", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await postCueTranscription(baseUrl, {
+      audioDataUrl: buildAudioDataUrl()
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.match(body.error, /OPENAI_API_KEY/);
+  });
+});
+
+test("POST /api/transcribe rejects requests without audio", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await postCueTranscription(baseUrl, {});
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(body.error, "Transcribe audioDataUrl is required.");
+  });
+});
+
+test("POST /api/transcribe rejects unsupported audio types", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await postCueTranscription(baseUrl, {
+      audioDataUrl: "data:audio/aiff;base64,AAAA"
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.match(body.error, /not supported/);
+  });
+});
+
+test("POST /api/transcribe requires the shared token when configured", async () => {
+  await withCueApiServer({ apiToken: "private-beta-token" }, async (baseUrl) => {
+    const blockedResponse = await postCueTranscription(baseUrl, {
+      audioDataUrl: buildAudioDataUrl()
+    });
+
+    assert.equal(blockedResponse.status, 401);
+  });
+});
+
+test("transcribeCueAudio sends multipart audio to OpenAI and returns the text", async () => {
+  let capturedUrl;
+  let capturedHeaders;
+  let capturedBody;
+
+  const result = await transcribeCueAudio(
+    {
+      audioBuffer: Buffer.from("fake-audio"),
+      mimeType: "audio/webm",
+      fileName: "audio.webm",
+      language: "en"
+    },
+    {
+      apiKey: "test-key",
+      fetch: async (url, init) => {
+        capturedUrl = url;
+        capturedHeaders = init.headers;
+        capturedBody = init.body;
+
+        return new Response(JSON.stringify({ text: "We agreed to bundle onboarding." }), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json"
+          }
+        });
+      }
+    }
+  );
+
+  assert.equal(capturedUrl, "https://api.openai.com/v1/audio/transcriptions");
+  assert.equal(capturedHeaders.Authorization, "Bearer test-key");
+  assert.ok(capturedBody instanceof FormData);
+  assert.equal(capturedBody.get("model"), "gpt-4o-mini-transcribe");
+  assert.equal(capturedBody.get("language"), "en");
+  assert.equal(capturedBody.get("file").name, "audio.webm");
+  assert.equal(result.provider, "openai");
+  assert.equal(result.model, "gpt-4o-mini-transcribe");
+  assert.equal(result.text, "We agreed to bundle onboarding.");
+});
+
+test("transcribeCueAudio surfaces provider rejections as retryable errors", async () => {
+  await assert.rejects(
+    transcribeCueAudio(
+      {
+        audioBuffer: Buffer.from("fake-audio"),
+        mimeType: "audio/webm",
+        fileName: "audio.webm"
+      },
+      {
+        apiKey: "test-key",
+        fetch: async () => new Response("{}", { status: 401 })
+      }
+    ),
+    (error) => {
+      assert.equal(error.statusCode, 502);
+      return true;
+    }
+  );
+});
+
 async function withCueApiServer(options, callback) {
   const server = createCueApiServer(options);
 
@@ -166,4 +274,19 @@ function postCueQuestion(baseUrl, body, headers = {}) {
     },
     body: JSON.stringify(body)
   });
+}
+
+function postCueTranscription(baseUrl, body, headers = {}) {
+  return fetch(`${baseUrl}/api/transcribe`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...headers
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+function buildAudioDataUrl() {
+  return `data:audio/webm;base64,${Buffer.from("fake-audio").toString("base64")}`;
 }

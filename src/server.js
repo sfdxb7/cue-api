@@ -2,7 +2,23 @@ import { createServer } from "node:http";
 import { pathToFileURL } from "node:url";
 
 const openAiResponsesUrl = "https://api.openai.com/v1/responses";
+const openAiTranscriptionsUrl = "https://api.openai.com/v1/audio/transcriptions";
 const defaultOpenAiModel = "gpt-5-mini";
+const defaultTranscriptionModel = "gpt-4o-mini-transcribe";
+const audioExtensionsByMimeType = new Map([
+  ["audio/webm", "webm"],
+  ["audio/ogg", "ogg"],
+  ["audio/wav", "wav"],
+  ["audio/x-wav", "wav"],
+  ["audio/mpeg", "mp3"],
+  ["audio/mp3", "mp3"],
+  ["audio/mp4", "mp4"],
+  ["audio/m4a", "m4a"],
+  ["audio/x-m4a", "m4a"],
+  ["audio/flac", "flac"],
+  ["video/webm", "webm"],
+  ["video/mp4", "mp4"]
+]);
 const defaultMaxBodyBytes = 15 * 1024 * 1024;
 const defaultRateLimitMax = 30;
 const defaultRateLimitWindowMs = 60 * 1000;
@@ -36,7 +52,7 @@ export function createCueApiServer(options = {}) {
       return;
     }
 
-    if (url.pathname !== "/api/intelligence") {
+    if (url.pathname !== "/api/intelligence" && url.pathname !== "/api/transcribe") {
       sendJson(response, 404, { error: "Not found." }, corsHeaders);
       return;
     }
@@ -72,6 +88,15 @@ export function createCueApiServer(options = {}) {
 
     try {
       const body = await readJsonBody(request, getMaxBodyBytes(options));
+
+      if (url.pathname === "/api/transcribe") {
+        const transcribeRequest = validateTranscribeRequest(body);
+        const result = await transcribeCueAudio(transcribeRequest, options);
+
+        sendJson(response, 200, result, corsHeaders);
+        return;
+      }
+
       const cueRequest = validateCueRequest(body);
       const result = await answerCueIntelligence(cueRequest, options);
 
@@ -129,6 +154,112 @@ export async function answerCueIntelligence(request, options = {}) {
   } catch {
     return fallbackCueIntelligence(request);
   }
+}
+
+export async function transcribeCueAudio(request, options = {}) {
+  const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+  const fetchImpl = options.fetch ?? globalThis.fetch;
+
+  if (!apiKey || typeof fetchImpl !== "function") {
+    throw createHttpError(
+      503,
+      "Transcription is not configured. Set OPENAI_API_KEY on the Cue API service."
+    );
+  }
+
+  const model =
+    options.transcriptionModel ??
+    process.env.OPENAI_TRANSCRIPTION_MODEL ??
+    defaultTranscriptionModel;
+  const formData = new FormData();
+
+  formData.append(
+    "file",
+    new Blob([request.audioBuffer], { type: request.mimeType }),
+    request.fileName
+  );
+  formData.append("model", model);
+
+  if (request.language) {
+    formData.append("language", request.language);
+  }
+
+  if (request.prompt) {
+    formData.append("prompt", request.prompt);
+  }
+
+  let response;
+
+  try {
+    response = await fetchImpl(openAiTranscriptionsUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: formData
+    });
+  } catch {
+    throw createHttpError(502, "Transcription request failed.");
+  }
+
+  if (!response.ok) {
+    throw createHttpError(502, "Transcription provider rejected the request.");
+  }
+
+  const payload = await response.json();
+  const text = getString(isRecord(payload) ? payload.text : undefined);
+
+  if (text === undefined) {
+    throw createHttpError(502, "Transcription provider returned no text.");
+  }
+
+  return {
+    provider: "openai",
+    model,
+    text
+  };
+}
+
+function validateTranscribeRequest(value) {
+  if (!isRecord(value)) {
+    throw createHttpError(400, "Transcribe request must be a JSON object.");
+  }
+
+  const audioDataUrl = getString(value.audioDataUrl);
+
+  if (!audioDataUrl) {
+    throw createHttpError(400, "Transcribe audioDataUrl is required.");
+  }
+
+  const dataUrlMatch = audioDataUrl.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/);
+
+  if (!dataUrlMatch) {
+    throw createHttpError(400, "Transcribe audioDataUrl must be a base64 data URL.");
+  }
+
+  const mimeType = dataUrlMatch[1].toLowerCase();
+  const extension = audioExtensionsByMimeType.get(mimeType);
+
+  if (!extension) {
+    throw createHttpError(
+      400,
+      `Transcribe audio type ${mimeType} is not supported. Use webm, ogg, wav, mp3, mp4, m4a, or flac audio.`
+    );
+  }
+
+  const audioBuffer = Buffer.from(dataUrlMatch[2].replace(/\s/g, ""), "base64");
+
+  if (audioBuffer.byteLength === 0) {
+    throw createHttpError(400, "Transcribe audio is empty.");
+  }
+
+  return {
+    audioBuffer,
+    mimeType,
+    fileName: `audio.${extension}`,
+    language: getString(value.language),
+    prompt: getString(value.prompt)
+  };
 }
 
 function buildOpenAiContent(request) {
