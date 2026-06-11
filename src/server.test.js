@@ -124,6 +124,92 @@ test("answerCueIntelligence parses compact OpenAI JSON responses", async () => {
   assert.equal(result.source, "screen + transcript");
 });
 
+test("POST /api/intelligence rejects oversized questions", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await postCueQuestion(baseUrl, {
+      mode: "live",
+      question: "x".repeat(2001)
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.match(body.error, /2000 characters/);
+  });
+});
+
+test("POST /api/intelligence rejects non-image screen data URLs", async () => {
+  await withCueApiServer({}, async (baseUrl) => {
+    const response = await postCueQuestion(baseUrl, {
+      mode: "live",
+      question: "What is on the screen?",
+      screen: {
+        description: "Captured browser tab",
+        imageDataUrl: "data:text/html;base64,AAAA"
+      }
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.match(body.error, /png, jpeg, webp, or gif/);
+  });
+});
+
+test("rate limiting ignores spoofed X-Forwarded-For unless trustProxy is enabled", async () => {
+  await withCueApiServer({ rateLimitMax: 2 }, async (baseUrl) => {
+    const statuses = [];
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await postCueQuestion(baseUrl, buildLiveRequest(), {
+        "X-Forwarded-For": `10.0.0.${attempt}`
+      });
+      statuses.push(response.status);
+    }
+
+    assert.deepEqual(statuses, [200, 200, 429]);
+  });
+});
+
+test("CORS omits Access-Control-Allow-Origin for non-allowlisted origins", async () => {
+  await withCueApiServer({ corsOrigin: "chrome-extension://allowed-id" }, async (baseUrl) => {
+    const blocked = await postCueQuestion(baseUrl, buildLiveRequest(), {
+      Origin: "https://evil.example"
+    });
+    const allowed = await postCueQuestion(baseUrl, buildLiveRequest(), {
+      Origin: "chrome-extension://allowed-id"
+    });
+
+    assert.equal(blocked.headers.get("access-control-allow-origin"), null);
+    assert.equal(
+      allowed.headers.get("access-control-allow-origin"),
+      "chrome-extension://allowed-id"
+    );
+  });
+});
+
+test("answerCueIntelligence passes an abort signal and truncates long transcripts", async () => {
+  let capturedInit;
+
+  await answerCueIntelligence(
+    {
+      mode: "live",
+      question: "What did I miss?",
+      transcript: "a".repeat(30000)
+    },
+    {
+      apiKey: "test-key",
+      fetch: async (url, init) => {
+        capturedInit = init;
+        return new Response(JSON.stringify({ output_text: '{"answer":"ok"}' }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+    }
+  );
+
+  assert.ok(capturedInit.signal instanceof AbortSignal);
+});
+
 test("POST /api/transcribe explains when transcription is not configured", async () => {
   await withCueApiServer({}, async (baseUrl) => {
     const response = await postCueTranscription(baseUrl, {

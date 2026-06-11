@@ -3,3 +3,6 @@ npm-debug.log
 test-results
 *.test.js
 **/*.test.js
+.env
+.env.*
+.git
